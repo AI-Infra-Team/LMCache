@@ -1,0 +1,7 @@
+# LMCache 的基本设置
+chunk_size: 16
+remote_serde: "naive"            # Mooncake 示例中使用 naive 序列化
+remote_url: "fluxon:///home/hzx/LMCache/fluxon.yaml" # fluxon 配置文件路径
+# 本地缓存设置
+local_cpu: false                 # 不使用本地 CPU 缓存
+max_local_cpu_size: "8.0"        # 单位 GB

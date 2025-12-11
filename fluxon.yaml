@@ -1,0 +1,14 @@
+instance_key: "client-vllm-dell03"
+contribute_to_cluster_pool_size:
+  dram: 0
+  vram: {}
+protocal:
+  type: tcp
+  rdma_device_name: ""
+log_level: DEBUG
+fluxonkv_spec:
+  etcd_addresses:
+    - "192.168.0.207:32579"
+  cluster_name: "fluxon-benchmark-cluster"
+  shared_memory_path: "/home/hzx/fluxon/deployment/test_deploy/fluxon_test_cluster"
+  transfer_engine: "nixl"
