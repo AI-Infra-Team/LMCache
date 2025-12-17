@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, no_type_check
 import asyncio
+import time
 
 # Third Party
 from kvcache_api_layer.config import FluxonKvClientConfig
@@ -58,7 +59,7 @@ class FluxonConnector(RemoteConnector):
 
     def _exists_sync(self, key_str: str) -> bool:
         """Blocking existence check using FluxonKVCacheStore."""
-        logger.info("Fluxon is_exist for key %s start", key_str)
+        #logger.info("Fluxon is_exist for key %s start", key_str)
         result = self.store.is_exist(key_str)
         err = getattr(result, "error", None)() if hasattr(result, "error") else None
         if err is not None:
@@ -89,7 +90,7 @@ class FluxonConnector(RemoteConnector):
             if hasattr(wait_result, "success")
             else None  # type: ignore[call-arg]
         )
-        logger.info("Fluxon is_exist for key %s done, is_exist: %s", key_str, exists_val)
+        #logger.info("Fluxon is_exist for key %s done, is_exist: %s", key_str, exists_val)
         return bool(exists_val)
 
     async def exists(self, key: CacheEngineKey) -> bool:
@@ -106,7 +107,7 @@ class FluxonConnector(RemoteConnector):
 
     def _get_value_bytes(self, key_str: str) -> Optional[bytes]:
         """Blocking get that returns raw value bytes (metadata + payload)."""
-        logger.info("Fluxon get for key %s start", key_str)
+        #logger.info("Fluxon get for key %s start", key_str)
         result = self.store.get(key_str)
         err = getattr(result, "error", None)() if hasattr(result, "error") else None
         if err is not None:
@@ -183,7 +184,7 @@ class FluxonConnector(RemoteConnector):
         metadata_bytes = view[:METADATA_BYTES_LEN]
         metadata = RemoteMetadata.deserialize(metadata_bytes)
 
-        logger.info(f"Fluxon get for key {key_str} deserialized metadata: {metadata}")
+        #logger.info("Fluxon get for key {key_str} deserialized metadata: {metadata}")
 
         memory_obj = self.local_cpu_backend.allocate(
             metadata.shape,
@@ -214,11 +215,13 @@ class FluxonConnector(RemoteConnector):
                 mv = mv.cast('B')
             mv[: metadata.length] = data_view
         
-        logger.info(f"Fluxon get for key %s done", key_str)
+        #logger.info("Fluxon get for key %s done", key_str)
 
         return memory_obj
 
     def _put_sync(self, key_str: str, memory_obj: MemoryObj) -> None:
+        t_total0 = time.perf_counter()
+
         kv_bytes = memory_obj.byte_array
         kv_shape = memory_obj.get_shape()
         kv_dtype = memory_obj.get_dtype()
@@ -228,10 +231,23 @@ class FluxonConnector(RemoteConnector):
             len(kv_bytes), kv_shape, kv_dtype, memory_format
         ).serialize()
 
-        payload = metadata_bytes + kv_bytes
+        meta_size = len(metadata_bytes)
+        kv_size = len(kv_bytes)
+        payload_size = meta_size + kv_size
 
-        logger.info("Fluxon put for key %s start", key_str)
-        result = self.store.put(key_str, payload)
+        # store.put
+        t0 = time.perf_counter()
+        try:
+            result = self.store.put(key_str, metadata_bytes, kv_bytes)
+        except Exception:
+            cost_ms = (time.perf_counter() - t0) * 1000
+            logger.exception(
+                "fluxon_put store_put failed key=%s payload_bytes=%d cost_ms=%.2f",
+                key_str, payload_size, cost_ms
+            )
+            raise
+        put_call_ms = (time.perf_counter() - t0) * 1000
+
         err = getattr(result, "error", None)() if hasattr(result, "error") else None
         if err is not None:
             raise RuntimeError(f"Fluxon put error for key {key_str}: {err}")
@@ -243,8 +259,17 @@ class FluxonConnector(RemoteConnector):
             raise RuntimeError(
                 f"Fluxon put success() returned None for key {key_str}"
             )
+        
+        # future.wait()
+        t0 = time.perf_counter()
+        try:
+            wait_result = future.wait()
+        except Exception:
+            cost_ms = (time.perf_counter() - t0) * 1000
+            logger.exception("fluxon_put wait failed key=%s cost_ms=%.2f", key_str, cost_ms)
+            raise
+        wait_ms = (time.perf_counter() - t0) * 1000
 
-        wait_result = future.wait()
         wait_err = (
             wait_result.error()
             if hasattr(wait_result, "error")
@@ -254,8 +279,25 @@ class FluxonConnector(RemoteConnector):
             raise RuntimeError(
                 f"Fluxon put future error for key {key_str}: {wait_err}"
             )
-        
-        logger.info(f"Fluxon put for key %s done", key_str)
+
+        # 成功日志（含总耗时 + 各阶段耗时）
+        total_ms = (time.perf_counter() - t_total0) * 1000
+        if total_ms > 200:  # 可调阈值
+            logger.warning(
+                "fluxon_put ok_slow key=%s total_ms=%.2f payload_bytes=%d meta_bytes=%d kv_bytes=%d "
+                "put_call_ms=%.2f wait_ms=%.2f",
+                key_str, total_ms, payload_size, meta_size, kv_size,
+                put_call_ms, wait_ms
+            )
+        else:
+            logger.info(
+                "fluxon_put ok key=%s total_ms=%.2f payload_bytes=%d meta_bytes=%d kv_bytes=%d "
+                "put_call_ms=%.2f wait_ms=%.2f",
+                key_str, total_ms, payload_size, meta_size, kv_size,
+                put_call_ms, wait_ms
+            )
+        #logger.info("Fluxon put for key %s done", key_str)
+        return time.perf_counter()
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
         key_str = self._key_to_str(key)
