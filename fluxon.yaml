@@ -1,4 +1,4 @@
-instance_key: "client-vllm-dell03"
+instance_key: "client-vllm-infra41"
 contribute_to_cluster_pool_size:
   dram: 0
   vram: {}
@@ -8,7 +8,7 @@ protocal:
 log_level: DEBUG
 fluxonkv_spec:
   etcd_addresses:
-    - "192.168.0.207:32579"
+    - "192.168.151.41:32579"
   cluster_name: "fluxon-benchmark-cluster"
-  shared_memory_path: "/home/hzx/fluxon/deployment/test_deploy/fluxon_test_cluster"
+  shared_memory_path: "/home/zyc/fluxon/deployment/test_deploy/fluxon_test_cluster"
   transfer_engine: "nixl"

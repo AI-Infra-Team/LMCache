@@ -1,0 +1,25 @@
+# Ray head + vLLM API server.
+# Usage (on HEAD node):
+#   ./start_vllm.py -c configs/ray/head_redis.yaml
+#
+lmcache_config_file: "configs/lmcache/redis.yaml"
+
+model: /home/zyc/vllm/models/Qwen3-1.7B
+host: 0.0.0.0
+port: 8000
+
+# Set to total GPU count across the Ray cluster (or omit and use extra_vllm_args).
+tp: 2
+
+ray:
+  mode: head
+  port: 6387
+  dashboard_host: 0.0.0.0
+
+kv_transfer_config:
+  kv_connector: LMCacheConnectorV1
+  kv_role: kv_both
+
+pyhashseed: "0"
+env: {}
+extra_vllm_args: []

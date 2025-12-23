@@ -1,0 +1,14 @@
+chunk_size: 256
+remote_url: "valkey://127.0.0.1:6379"
+remote_serde: "naive"
+
+# Optional local buffer (recommended)
+local_cpu: true
+max_local_cpu_size: "8.0" # GiB
+
+# If auth is enabled, fill these in.
+extra_config:
+  valkey_username: ""
+  valkey_password: ""
+  # valkey_database: 0
+  # valkey_mode: "cluster"

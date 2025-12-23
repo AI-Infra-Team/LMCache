@@ -1,0 +1,9 @@
+# Ray worker join config (Valkey remote store for LMCache).
+lmcache_config_file: "configs/lmcache/valkey.yaml"
+
+ray:
+  mode: worker
+  head_host: "HEAD_IP"
+  port: 6387
+
+env: {}

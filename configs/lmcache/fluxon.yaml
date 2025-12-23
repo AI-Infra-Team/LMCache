@@ -1,0 +1,13 @@
+chunk_size: 256
+remote_serde: "naive"
+
+# Fluxon remote URL format:
+#   fluxon:///absolute/path/to/fluxon_client_config.yaml
+#
+# This path is read by the vLLM/LMCache process, so it must exist on every node
+# where vLLM runs (for Ray multi-node, that means head + all workers).
+remote_url: "fluxon:///path/to/fluxon_client_config.yaml"
+
+# Optional local buffer
+local_cpu: true
+max_local_cpu_size: "8.0" # GiB

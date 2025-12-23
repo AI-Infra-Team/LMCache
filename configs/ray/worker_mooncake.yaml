@@ -1,0 +1,9 @@
+# Ray worker join config (Mooncake remote store for LMCache).
+lmcache_config_file: "configs/lmcache/mooncake.yaml"
+
+ray:
+  mode: worker
+  head_host: "HEAD_IP"
+  port: 6387
+
+env: {}
