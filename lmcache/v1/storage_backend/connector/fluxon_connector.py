@@ -1,101 +1,89 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, no_type_check
+from typing import Any, Dict, List, Optional, Union, no_type_check
 import asyncio
-import time
 
 # Third Party
-from kvcache_api_layer.config import FluxonKvClientConfig
-from kvcache_api_layer.kvclient import new_store
+import torch
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import MemoryObj, MemoryObjMetadata, TensorMemoryObj
 from lmcache.v1.protocol import RemoteMetadata
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 logger = init_logger(__name__)
 
-METADATA_BYTES_LEN = 28
+try:
+    from fluxon_py import FluxonKvClientConfig, new_store
+
+    _fluxon_import_error: Optional[BaseException] = None
+except Exception as e:
+    FluxonKvClientConfig = None  # type: ignore[assignment]
+    new_store = None  # type: ignore[assignment]
+    _fluxon_import_error = e
+    logger.warning(
+        "FluxonConnector disabled because `fluxon_py` import failed: %s. "
+        "This is expected if Fluxon is not installed; LMCache will raise only when "
+        "a `fluxon://` remote_url is used.",
+        e,
+    )
+
+_FIELD_META = "lmcache_meta"
+_FIELD_DATA = "lmcache_data"
 
 
 class FluxonConnector(RemoteConnector):
-    """LMCache remote connector backed by Fluxon KV."""
+    """LMCache remote connector backed by Fluxon KV (via `fluxon_py`)."""
 
     def __init__(
         self,
-        config_path: Optional[str],
+        config_path: str,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
     ):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        # Load Fluxon config from yaml file.
-        # If config_path is None or empty, fallback to FluxonKvClientConfig.from_file().
-        if config_path is not None and config_path != "":
-            cfg = FluxonKvClientConfig.from_file(config_path)
-            logger.info("FluxonConnector using config file: %s", config_path)
-        else:
-            cfg = FluxonKvClientConfig.from_file()
-            logger.info("FluxonConnector using default config file path")
+        if _fluxon_import_error is not None:
+            raise RuntimeError(
+                "FluxonConnector requires the Fluxon Python package. "
+                "Install it (for example): `pip install -e ./fluxon` "
+                "or ensure `fluxon_py` is importable. "
+                f"Import error: {_fluxon_import_error}"
+            )
+        assert FluxonKvClientConfig is not None
+        assert new_store is not None
+
+        cfg = FluxonKvClientConfig.from_file(config_path)
+        logger.info("FluxonConnector using config file: %s", config_path)
 
         store_result = new_store(cfg)
-        err = store_result.error()
-        if err is not None:
+        if not getattr(store_result, "is_ok")():
+            err = store_result.unwrap_error()
             raise RuntimeError(f"Failed to initialize Fluxon KV store: {err}")
 
-        store = store_result.success()
-        if store is None:
-            raise RuntimeError("new_store returned success=None for Fluxon KV store")
-
-        self.store = store
+        self.store = store_result.unwrap()
         logger.info("FluxonConnector initialized Fluxon KV store successfully")
 
     def _key_to_str(self, key: CacheEngineKey) -> str:
         return key.to_string()
 
+    @staticmethod
+    def _unwrap_result(res: Any, *, op: str) -> Any:
+        if not getattr(res, "is_ok")():
+            err = res.unwrap_error()
+            raise RuntimeError(f"Fluxon {op} failed: {err}")
+        return res.unwrap()
+
     def _exists_sync(self, key_str: str) -> bool:
-        """Blocking existence check using FluxonKVCacheStore."""
-        #logger.info("Fluxon is_exist for key %s start", key_str)
-        result = self.store.is_exist(key_str)
-        err = getattr(result, "error", None)() if hasattr(result, "error") else None
-        if err is not None:
-            logger.warning("Fluxon is_exist error for key %s: %s", key_str, err)
-            return False
-
-        future = (
-            result.success() if hasattr(result, "success") else None  # type: ignore[call-arg]
-        )
-        if future is None:
-            logger.warning("Fluxon is_exist success() returned None for key %s", key_str)
-            return False
-
-        wait_result = future.wait()
-        wait_err = (
-            wait_result.error()
-            if hasattr(wait_result, "error")
-            else None  # type: ignore[call-arg]
-        )
-        if wait_err is not None:
-            logger.warning(
-                "Fluxon is_exist future error for key %s: %s", key_str, wait_err
-            )
-            return False
-
-        exists_val = (
-            wait_result.success()
-            if hasattr(wait_result, "success")
-            else None  # type: ignore[call-arg]
-        )
-        #logger.info("Fluxon is_exist for key %s done, is_exist: %s", key_str, exists_val)
-        return bool(exists_val)
+        res = self.store.is_exist(key_str)
+        return bool(self._unwrap_result(res, op="is_exist"))
 
     async def exists(self, key: CacheEngineKey) -> bool:
-        key_str = self._key_to_str(key)
-        return await asyncio.to_thread(self._exists_sync, key_str)
+        return await asyncio.to_thread(self._exists_sync, self._key_to_str(key))
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         future = asyncio.run_coroutine_threadsafe(self.exists(key), self.loop)
@@ -105,217 +93,131 @@ class FluxonConnector(RemoteConnector):
             logger.warning("FluxonConnector.exists_sync failed for key %s: %s", key, e)
             return False
 
-    def _get_value_bytes(self, key_str: str) -> Optional[bytes]:
-        """Blocking get that returns raw value bytes (metadata + payload)."""
-        #logger.info("Fluxon get for key %s start", key_str)
-        result = self.store.get(key_str)
-        err = getattr(result, "error", None)() if hasattr(result, "error") else None
-        if err is not None:
-            logger.warning("Fluxon get error for key %s: %s", key_str, err)
-            return None
-
-        future = (
-            result.success() if hasattr(result, "success") else None  # type: ignore[call-arg]
-        )
-        if future is None:
-            logger.warning("Fluxon get success() returned None for key %s", key_str)
-            return None
-
-        wait_result = future.wait()
-        wait_err = (
-            wait_result.error()
-            if hasattr(wait_result, "error")
-            else None  # type: ignore[call-arg]
-        )
-        if wait_err is not None:
-            logger.warning(
-                "Fluxon get future error for key %s: %s", key_str, wait_err
+    def _get_value(self, key_str: str) -> Dict[str, Any]:
+        res = self.store.get(key_str)
+        fut = self._unwrap_result(res, op="get")
+        wait_res = fut.wait()
+        holder = self._unwrap_result(wait_res, op="get.wait")
+        access_res = holder.access()
+        value = self._unwrap_result(access_res, op="memholder.access")
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"Fluxon get returned non-dict value for key {key_str}: {type(value)}"
             )
-            return None
 
-        holder = (
-            wait_result.success()
-            if hasattr(wait_result, "success")
-            else None  # type: ignore[call-arg]
-        )
-        if holder is None:
-            logger.warning("Fluxon get future success() is None for key %s", key_str)
-            return None
-
-        bytes_result = holder.bytes()
-        bytes_err = (
-            bytes_result.error()
-            if hasattr(bytes_result, "error")
-            else None  # type: ignore[call-arg]
-        )
-        if bytes_err is not None:
-            logger.warning(
-                "Fluxon MemHolder.bytes() error for key %s: %s", key_str, bytes_err
-            )
-            return None
-
-        value = (
-            bytes_result.success()
-            if hasattr(bytes_result, "success")
-            else None  # type: ignore[call-arg]
-        )
-        if value is None:
-            logger.warning(
-                "Fluxon MemHolder.bytes().success() returned None for key %s", key_str
-            )
-            return None
-
+        # Keep `holder` alive by attaching it to the returned dict.
+        # The underlying KV payload may be backed by shared memory managed by
+        # the MemHolder; without keeping it alive, dlpack views can dangle.
+        value["_lmcache_fluxon_memholder"] = holder
         return value
+
+    def _build_memory_obj_from_value(
+        self, key_str: str, value: Dict[str, Any]
+    ) -> Optional[MemoryObj]:
+        meta_bytes = value.get(_FIELD_META)
+        data_obj = value.get(_FIELD_DATA)
+        if not isinstance(meta_bytes, (bytes, bytearray, memoryview)):
+            logger.warning(
+                "FluxonConnector.get: missing/invalid meta field for key %s: %s",
+                key_str,
+                type(meta_bytes),
+            )
+            return None
+
+        metadata = RemoteMetadata.deserialize(memoryview(meta_bytes))
+        if metadata.dtype is None:
+            logger.warning(
+                "FluxonConnector.get: invalid dtype in metadata for key %s", key_str
+            )
+            return None
+
+        holder = value.get("_lmcache_fluxon_memholder")
+
+        if not hasattr(data_obj, "__dlpack__"):
+            raise RuntimeError(
+                f"FluxonConnector.get requires dlpack-backed payload for key {key_str}, "
+                f"but got type={type(data_obj)}"
+            )
+
+        typed = torch.utils.dlpack.from_dlpack(data_obj)
+        raw_uint8 = typed.view(torch.uint8).reshape(-1)
+
+        expected_bytes = int(metadata.length)
+        if raw_uint8.numel() < expected_bytes:
+            logger.warning(
+                "FluxonConnector.get: data length too short for key %s: got=%d need=%d",
+                key_str,
+                raw_uint8.numel(),
+                expected_bytes,
+            )
+            return None
+
+        if raw_uint8.numel() > expected_bytes:
+            raw_uint8 = raw_uint8[:expected_bytes]
+
+        meta = MemoryObjMetadata(
+            shape=metadata.shape,
+            dtype=metadata.dtype,
+            address=int(raw_uint8.data_ptr()),
+            phy_size=int(raw_uint8.numel()),
+            ref_count=1,
+            pin_count=0,
+            fmt=metadata.fmt,
+        )
+        memory_obj = TensorMemoryObj(raw_uint8, meta, parent_allocator=None)
+        # Keep Fluxon memholder alive for the lifetime of the returned MemoryObj,
+        # otherwise dlpack views can dangle after this function returns.
+        setattr(memory_obj, "_fluxon_memholder", holder)
+        return memory_obj
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         key_str = self._key_to_str(key)
-        value = await asyncio.to_thread(self._get_value_bytes, key_str)
-        if value is None:
-            return None
+        value = await asyncio.to_thread(self._get_value, key_str)
+        return self._build_memory_obj_from_value(key_str, value)
 
-        if len(value) < METADATA_BYTES_LEN:
-            logger.warning(
-                "FluxonConnector.get: value for key %s is shorter than metadata size",
-                key_str,
-            )
-            return None
-
-        view = memoryview(value)
-        metadata_bytes = view[:METADATA_BYTES_LEN]
-        metadata = RemoteMetadata.deserialize(metadata_bytes)
-
-        #logger.info("Fluxon get for key {key_str} deserialized metadata: {metadata}")
-
-        memory_obj = self.local_cpu_backend.allocate(
-            metadata.shape,
-            metadata.dtype,
-            metadata.fmt,
-        )
-        if memory_obj is None:
-            logger.warning(
-                "FluxonConnector.get: failed to allocate memory for key %s", key_str
-            )
-            return None
-
-        buffer = memory_obj.byte_array
-        data_view = view[METADATA_BYTES_LEN : METADATA_BYTES_LEN + metadata.length]
-
-        if isinstance(buffer, (bytearray, bytes)):
-            buffer[: metadata.length] = data_view.tobytes()
-        elif isinstance(buffer, memoryview):
-            # See LMCache's PR#622 https://github.com/LMCache/LMCache/pull/662
-            if buffer.format == '<B':
-                mv = buffer.cast('B') 
-            else:
-                mv = buffer
-            mv[: metadata.length] = data_view
-        else:
-            mv = memoryview(buffer)
-            if mv.format == '<B':
-                mv = mv.cast('B')
-            mv[: metadata.length] = data_view
-        
-        #logger.info("Fluxon get for key %s done", key_str)
-
-        return memory_obj
-
-    def _put_sync(self, key_str: str, memory_obj: MemoryObj) -> None:
-        t_total0 = time.perf_counter()
+    def _put_payload(self, memory_obj: MemoryObj) -> torch.Tensor:
+        raw = getattr(memory_obj, "raw_data", None)
+        if isinstance(raw, torch.Tensor) and raw.device.type == "cpu":
+            return raw.view(torch.uint8).reshape(-1)
+        t = getattr(memory_obj, "tensor", None)
+        if isinstance(t, torch.Tensor) and t.device.type == "cpu":
+            return t.view(torch.uint8).reshape(-1)
 
         kv_bytes = memory_obj.byte_array
+        buf = memoryview(kv_bytes) if not isinstance(kv_bytes, memoryview) else kv_bytes
+        return torch.frombuffer(buf, dtype=torch.uint8)
+
+    def _put_sync(self, key_str: str, memory_obj: MemoryObj) -> None:
         kv_shape = memory_obj.get_shape()
         kv_dtype = memory_obj.get_dtype()
         memory_format = memory_obj.get_memory_format()
 
         metadata_bytes = RemoteMetadata(
-            len(kv_bytes), kv_shape, kv_dtype, memory_format
+            len(memory_obj.byte_array), kv_shape, kv_dtype, memory_format
         ).serialize()
 
-        meta_size = len(metadata_bytes)
-        kv_size = len(kv_bytes)
-        payload_size = meta_size + kv_size
+        payload: Dict[str, Union[bytes, torch.Tensor]] = {
+            _FIELD_META: metadata_bytes,
+            _FIELD_DATA: self._put_payload(memory_obj),
+        }
 
-        # store.put
-        t0 = time.perf_counter()
-        try:
-            result = self.store.put(key_str, metadata_bytes, kv_bytes)
-        except Exception:
-            cost_ms = (time.perf_counter() - t0) * 1000
-            logger.exception(
-                "fluxon_put store_put failed key=%s payload_bytes=%d cost_ms=%.2f",
-                key_str, payload_size, cost_ms
-            )
-            raise
-        put_call_ms = (time.perf_counter() - t0) * 1000
-
-        err = getattr(result, "error", None)() if hasattr(result, "error") else None
-        if err is not None:
-            raise RuntimeError(f"Fluxon put error for key {key_str}: {err}")
-
-        future = (
-            result.success() if hasattr(result, "success") else None  # type: ignore[call-arg]
-        )
-        if future is None:
-            raise RuntimeError(
-                f"Fluxon put success() returned None for key {key_str}"
-            )
-        
-        # future.wait()
-        t0 = time.perf_counter()
-        try:
-            wait_result = future.wait()
-        except Exception:
-            cost_ms = (time.perf_counter() - t0) * 1000
-            logger.exception("fluxon_put wait failed key=%s cost_ms=%.2f", key_str, cost_ms)
-            raise
-        wait_ms = (time.perf_counter() - t0) * 1000
-
-        wait_err = (
-            wait_result.error()
-            if hasattr(wait_result, "error")
-            else None  # type: ignore[call-arg]
-        )
-        if wait_err is not None:
-            raise RuntimeError(
-                f"Fluxon put future error for key {key_str}: {wait_err}"
-            )
-
-        # 成功日志（含总耗时 + 各阶段耗时）
-        total_ms = (time.perf_counter() - t_total0) * 1000
-        if total_ms > 200:  # 可调阈值
-            logger.warning(
-                "fluxon_put ok_slow key=%s total_ms=%.2f payload_bytes=%d meta_bytes=%d kv_bytes=%d "
-                "put_call_ms=%.2f wait_ms=%.2f",
-                key_str, total_ms, payload_size, meta_size, kv_size,
-                put_call_ms, wait_ms
-            )
-        else:
-            logger.info(
-                "fluxon_put ok key=%s total_ms=%.2f payload_bytes=%d meta_bytes=%d kv_bytes=%d "
-                "put_call_ms=%.2f wait_ms=%.2f",
-                key_str, total_ms, payload_size, meta_size, kv_size,
-                put_call_ms, wait_ms
-            )
-        #logger.info("Fluxon put for key %s done", key_str)
-        return time.perf_counter()
+        res = self.store.put(key_str, payload)
+        fut = self._unwrap_result(res, op="put")
+        wait_res = fut.wait()
+        _ = self._unwrap_result(wait_res, op="put.wait")
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
-        key_str = self._key_to_str(key)
-        await asyncio.to_thread(self._put_sync, key_str, memory_obj)
-
-    # For now we do not expose batched optimizations; RemoteBackend will
-    # fall back to per-key put/get when support_batched_* is False.
+        await asyncio.to_thread(self._put_sync, self._key_to_str(key), memory_obj)
 
     @no_type_check
     async def list(self) -> List[str]:
-        # Fluxon KV API does not expose listing keys in the unified client;
-        # return an empty list to satisfy interface.
+        # Fluxon KV API does not expose listing keys in the unified client.
         return []
 
     async def close(self):
-        result = self.store.close()
-        err = getattr(result, "error", None)() if hasattr(result, "error") else None
-        if err is not None:
-            logger.warning("FluxonConnector.close error: %s", err)
-        else:
+        try:
+            res = self.store.close()
+            _ = self._unwrap_result(res, op="close")
             logger.info("Closed Fluxon KV store connection")
+        except Exception as e:
+            logger.warning("FluxonConnector.close failed: %s", e)

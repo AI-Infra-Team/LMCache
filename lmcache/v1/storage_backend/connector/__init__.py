@@ -244,6 +244,7 @@ def CreateConnector(
     - redis://[[username]:[password]@]host[:port][/database][?option=value]
     - rediss://[[username]:[password]@]host[:port][/database][?option=value] (SSL)
     - redis-sentinel://[[username]:[password]@]host1:port1[,host2:port2,...]/service_name
+    - fluxon:///absolute/path/to/fluxon_client_config.yaml
     - lm://host:port
     - infinistore://host:port[?device=device_name]
     - mooncakestore://host:port[?device=device_name]
@@ -259,6 +260,7 @@ def CreateConnector(
     - redis://localhost:6379
     - rediss://user:password@redis.example.com:6380/0
     - redis-sentinel://user:password@sentinel1:26379,sentinel2:26379/mymaster
+    - fluxon:///etc/lmcache/fluxon_client_config.yaml
     - lm://localhost:65432
     - infinistore://127.0.0.1:12345?device=mlx5_0
     - mooncakestore://127.0.0.1:50051

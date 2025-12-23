@@ -5,7 +5,7 @@ from lmcache.v1.storage_backend.connector import ConnectorAdapter, ConnectorCont
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
 
 # Standard
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 logger = init_logger(__name__)
 
@@ -26,7 +26,11 @@ class FluxonConnectorAdapter(ConnectorAdapter):
 
         parsed = urlparse(context.url)
 
-        logger.info("Fluxon url parsed: %s, config file path: %s", parsed, parsed.path)
+        if not parsed.path:
+            raise ValueError(
+                "Invalid Fluxon remote_url; expected format "
+                "'fluxon:///absolute/path/to/fluxon_client_config.yaml'"
+            )
 
         return FluxonConnector(
             config_path=parsed.path,
